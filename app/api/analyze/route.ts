@@ -13,11 +13,23 @@ type ConfigRecord = {
   trial_quota: number;
   periodic_quota_days: number;
   periodic_quota: number;
+  trial_warning_remaining: number;
+  periodic_warning_remaining: number;
+  quota_exhausted_notice_enabled: boolean;
+};
+
+type QuotaReservationRecord = {
+  usage: number;
+  quota: number;
+  window_start: Date | string;
 };
 
 type Reservation = {
   allowed: boolean;
   quotaType?: QuotaType;
+  remaining?: number;
+  warningThreshold?: number;
+  windowStart?: Date | string;
 };
 
 function errorResponse(
@@ -158,6 +170,7 @@ export async function POST(req: Request) {
   const sql = neon(databaseUrl);
 
   let reservation: Reservation = { allowed: false };
+  let quotaExhaustedNoticeEnabled = true;
 
   try {
     const configResult = await sql`
@@ -165,7 +178,10 @@ export async function POST(req: Request) {
         trial_days,
         trial_quota,
         periodic_quota_days,
-        periodic_quota
+        periodic_quota,
+        trial_warning_remaining,
+        periodic_warning_remaining,
+        quota_exhausted_notice_enabled
       FROM system_config
       WHERE id = 1
     `;
@@ -182,6 +198,9 @@ export async function POST(req: Request) {
     }
 
     const config = configRows[0];
+
+    quotaExhaustedNoticeEnabled =
+      config.quota_exhausted_notice_enabled;
 
     // Create the user on their first request.
     await sql`
@@ -214,12 +233,7 @@ export async function POST(req: Request) {
       ON CONFLICT (user_uid) DO NOTHING
     `;
 
-    /*
-     * Renew an expired periodic quota window.
-     * The duration and quota are read from system_config.
-     * The UPDATE condition prevents concurrent requests
-     * from repeatedly renewing the same window.
-     */
+    // Renew an expired periodic quota window.
     await sql`
       UPDATE users
       SET
@@ -232,48 +246,59 @@ export async function POST(req: Request) {
         AND periodic_end_date <= NOW()
     `;
 
-    /*
-     * Try to reserve a trial request first.
-     *
-     * The conditional UPDATE is atomic. Concurrent requests
-     * cannot increment trial_usage beyond trial_quota.
-     */
-    const trialReservation = await sql`
+    // Reserve a trial request first.
+    const trialReservationResult = await sql`
       UPDATE users
       SET trial_usage = trial_usage + 1
       WHERE user_uid = ${userUid}
         AND trial_enabled = TRUE
         AND trial_end_date > NOW()
         AND trial_usage < trial_quota
-      RETURNING id
+      RETURNING
+        trial_usage AS usage,
+        trial_quota AS quota,
+        trial_start_date AS window_start
     `;
 
+    const trialReservation =
+      trialReservationResult as unknown as QuotaReservationRecord[];
+
     if (trialReservation.length > 0) {
+      const record = trialReservation[0];
+
       reservation = {
         allowed: true,
         quotaType: "trial",
+        remaining: record.quota - record.usage,
+        warningThreshold: config.trial_warning_remaining,
+        windowStart: record.window_start,
       };
     } else {
-      /*
-       * If the trial is unavailable or exhausted,
-       * try to reserve a periodic request.
-       *
-       * This is a separate conditional UPDATE, so the
-       * quota limit is checked atomically by PostgreSQL.
-       */
-      const periodicReservation = await sql`
+      // If trial quota is unavailable, try periodic quota.
+      const periodicReservationResult = await sql`
         UPDATE users
         SET periodic_usage = periodic_usage + 1
         WHERE user_uid = ${userUid}
           AND periodic_end_date > NOW()
           AND periodic_usage < periodic_quota
-        RETURNING id
+      RETURNING
+        periodic_usage AS usage,
+        periodic_quota AS quota,
+        periodic_start_date AS window_start
       `;
 
+      const periodicReservation =
+        periodicReservationResult as unknown as QuotaReservationRecord[];
+
       if (periodicReservation.length > 0) {
+        const record = periodicReservation[0];
+
         reservation = {
           allowed: true,
           quotaType: "periodic",
+          remaining: record.quota - record.usage,
+          warningThreshold: config.periodic_warning_remaining,
+          windowStart: record.window_start,
         };
       }
     }
@@ -290,7 +315,11 @@ export async function POST(req: Request) {
     return errorResponse(
       "You have reached your current usage limit.",
       429,
-      { quota_exceeded: true }
+      {
+        quota_exceeded: true,
+        quota_exhausted_notice_enabled:
+          quotaExhaustedNoticeEnabled,
+      }
     );
   }
 
@@ -402,7 +431,30 @@ Requirements:
       );
     }
 
-    return Response.json(data);
+    const remaining = reservation.remaining ?? 0;
+    const warningThreshold = reservation.warningThreshold ?? 0;
+
+    const windowStart = reservation.windowStart;
+
+    const windowId =
+      windowStart instanceof Date
+        ? windowStart.toISOString()
+        : new Date(windowStart ?? "").toISOString();
+
+    const quotaInfo = {
+      type: quotaType,
+      remaining,
+      warning_threshold: warningThreshold,
+      warning_due:
+        remaining > 0 && remaining <= warningThreshold,
+      window_id: windowId,
+      exhausted_notice_enabled: quotaExhaustedNoticeEnabled,
+    };
+
+    return Response.json({
+      ...(data as Record<string, unknown>),
+      quota: quotaInfo,
+    });
   } catch {
     console.error("OpenAI API request failed.");
 
